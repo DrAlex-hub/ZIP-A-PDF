@@ -1,0 +1,578 @@
+name: Compilar APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Aceptar licencias del SDK de Android
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "SDK en: $SDK"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Crear el proyecto
+        run: |
+          mkdir -p Zip2Pdf
+          cd Zip2Pdf
+          mkdir -p app
+          cat > app/build.gradle.kts <<'ZIP2PDF_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.zip2pdf"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.zip2pdf"
+                  minSdk = 29          // Android 10+: guardado en Descargas sin permisos
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+          }
+          ZIP2PDF_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'ZIP2PDF_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Sin permisos: no usa Internet ni almacenamiento externo clásico. -->
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.Zip2Pdf">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <!-- Permite "Abrir con…" desde el gestor de archivos -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="application/zip" />
+                          <data android:mimeType="application/x-zip-compressed" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          ZIP2PDF_EOF
+          mkdir -p app/src/main/java/com/example/zip2pdf
+          cat > app/src/main/java/com/example/zip2pdf/Converter.kt <<'ZIP2PDF_EOF'
+          package com.example.zip2pdf
+
+          import android.content.ContentResolver
+          import android.content.ContentValues
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.ImageDecoder
+          import android.net.Uri
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import java.io.ByteArrayOutputStream
+          import java.io.File
+          import java.io.IOException
+          import java.nio.ByteBuffer
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipFile
+
+          object Converter {
+
+              private const val MAX_DIM = 4096      // lado máximo; las imágenes mayores se reducen para no agotar la memoria
+              private const val JPEG_QUALITY = 92
+              private val EXTENSIONS = setOf("webp", "png", "jpg", "jpeg")
+
+              class Result(val fileName: String, val pages: Int, val skipped: Int)
+
+              private class Page(val jpeg: ByteArray, val width: Int, val height: Int)
+
+              fun convert(context: Context, source: Uri, onProgress: (done: Int, total: Int) -> Unit): Result {
+                  val resolver = context.contentResolver
+
+                  // Mismo nombre del ZIP, extensión .pdf
+                  val zipName = displayName(resolver, source) ?: "imagenes.zip"
+                  val pdfName = zipName.replace(Regex("\\.zip$", RegexOption.IGNORE_CASE), "") + ".pdf"
+
+                  // ZipFile necesita acceso aleatorio: copiamos el ZIP a la caché privada de la app.
+                  val temp = File.createTempFile("entrada", ".zip", context.cacheDir)
+                  try {
+                      val input = resolver.openInputStream(source) ?: throw IOException("No se pudo abrir el archivo.")
+                      input.use { src -> temp.outputStream().use { dst -> src.copyTo(dst) } }
+
+                      return ZipFile(temp).use { zip ->
+                          val images = zip.entries().asSequence()
+                              .filter { isImage(it) }
+                              .sortedWith { a, b -> natural(a.name, b.name) }
+                              .toList()
+                          if (images.isEmpty()) throw IOException("El ZIP no contiene imágenes .webp, .png o .jpg.")
+
+                          val values = ContentValues().apply {
+                              put(MediaStore.Downloads.DISPLAY_NAME, pdfName)
+                              put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+                              put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                              put(MediaStore.Downloads.IS_PENDING, 1)
+                          }
+                          val target = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                              ?: throw IOException("No se pudo crear el archivo en Descargas.")
+
+                          try {
+                              var pages = 0
+                              var skipped = 0
+                              val stream = resolver.openOutputStream(target)
+                                  ?: throw IOException("No se pudo escribir el PDF.")
+                              PdfWriter(stream).use { pdf ->
+                                  images.forEachIndexed { i, entry ->
+                                      onProgress(i, images.size)
+                                      val page = renderPage(zip, entry)
+                                      if (page == null) {
+                                          skipped++
+                                      } else {
+                                          pdf.addPage(page.jpeg, page.width, page.height)
+                                          pages++
+                                      }
+                                  }
+                                  if (pages == 0) throw IOException("No se pudo leer ninguna imagen del ZIP.")
+                                  pdf.finish()
+                              }
+                              onProgress(images.size, images.size)
+
+                              resolver.update(target, ContentValues().apply {
+                                  put(MediaStore.Downloads.IS_PENDING, 0)
+                              }, null, null)
+                              Result(pdfName, pages, skipped)
+                          } catch (e: Exception) {
+                              resolver.delete(target, null, null)   // no dejar PDFs a medias
+                              throw e
+                          }
+                      }
+                  } finally {
+                      temp.delete()
+                  }
+              }
+
+              /** Decodifica, dibuja sobre fondo blanco sólido y comprime a JPEG. */
+              private fun renderPage(zip: ZipFile, entry: ZipEntry): Page? {
+                  return try {
+                      val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                      val decoded = ImageDecoder.decodeBitmap(ImageDecoder.createSource(ByteBuffer.wrap(bytes))) { decoder, info, _ ->
+                          decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                          val longest = maxOf(info.size.width, info.size.height)
+                          var sample = 1
+                          while (longest / sample > MAX_DIM) sample *= 2
+                          if (sample > 1) decoder.setTargetSampleSize(sample)
+                      }
+
+                      val flat = Bitmap.createBitmap(decoded.width, decoded.height, Bitmap.Config.ARGB_8888)
+                      Canvas(flat).apply {
+                          drawColor(Color.WHITE)               // fondo blanco: sin transparencias negras
+                          drawBitmap(decoded, 0f, 0f, null)
+                      }
+                      decoded.recycle()
+
+                      val buffer = ByteArrayOutputStream(256 * 1024)
+                      flat.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, buffer)
+                      val page = Page(buffer.toByteArray(), flat.width, flat.height)
+                      flat.recycle()
+                      page
+                  } catch (e: Exception) {
+                      null
+                  } catch (e: OutOfMemoryError) {
+                      null
+                  }
+              }
+
+              private fun isImage(e: ZipEntry): Boolean {
+                  if (e.isDirectory || e.name.startsWith("__MACOSX/")) return false
+                  val base = e.name.substringAfterLast('/')
+                  if (base.startsWith(".")) return false
+                  return base.substringAfterLast('.', "").lowercase() in EXTENSIONS
+              }
+
+              private fun displayName(resolver: ContentResolver, uri: Uri): String? {
+                  resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                      if (c.moveToFirst()) return c.getString(0)
+                  }
+                  return uri.lastPathSegment?.substringAfterLast('/')
+              }
+
+              /** Orden natural: 2.webp va antes que 10.webp; ignora ceros a la izquierda y mayúsculas. */
+              private fun natural(a: String, b: String): Int {
+                  var i = 0
+                  var j = 0
+                  while (i < a.length && j < b.length) {
+                      if (a[i].isDigit() && b[j].isDigit()) {
+                          var ei = i
+                          while (ei < a.length && a[ei].isDigit()) ei++
+                          var ej = j
+                          while (ej < b.length && b[ej].isDigit()) ej++
+                          val na = a.substring(i, ei).trimStart('0')
+                          val nb = b.substring(j, ej).trimStart('0')
+                          if (na.length != nb.length) return na.length - nb.length
+                          val c = na.compareTo(nb)
+                          if (c != 0) return c
+                          i = ei
+                          j = ej
+                      } else {
+                          val c = a[i].lowercaseChar().compareTo(b[j].lowercaseChar())
+                          if (c != 0) return c
+                          i++
+                          j++
+                      }
+                  }
+                  return (a.length - i) - (b.length - j)
+              }
+          }
+          ZIP2PDF_EOF
+          mkdir -p app/src/main/java/com/example/zip2pdf
+          cat > app/src/main/java/com/example/zip2pdf/MainActivity.kt <<'ZIP2PDF_EOF'
+          package com.example.zip2pdf
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.View
+          import android.widget.Button
+          import android.widget.ProgressBar
+          import android.widget.TextView
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import java.util.concurrent.Executors
+
+          class MainActivity : AppCompatActivity() {
+
+              private val executor = Executors.newSingleThreadExecutor()
+              @Volatile private var busy = false
+
+              private lateinit var pick: Button
+              private lateinit var bar: ProgressBar
+              private lateinit var status: TextView
+
+              private val picker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                  if (uri != null) start(uri)
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  pick = findViewById(R.id.pick)
+                  bar = findViewById(R.id.bar)
+                  status = findViewById(R.id.status)
+
+                  pick.setOnClickListener {
+                      picker.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream"))
+                  }
+
+                  // "Abrir con…" desde un gestor de archivos
+                  if (savedInstanceState == null && intent?.action == Intent.ACTION_VIEW) {
+                      intent.data?.let { start(it) }
+                  }
+              }
+
+              private fun start(uri: Uri) {
+                  if (busy) return
+                  busy = true
+                  pick.isEnabled = false
+                  bar.visibility = View.VISIBLE
+                  bar.isIndeterminate = true
+                  status.text = getString(R.string.reading)
+
+                  val app = applicationContext
+                  executor.execute {
+                      val message = try {
+                          val r = Converter.convert(app, uri) { done, total ->
+                              runOnUiThread {
+                                  bar.isIndeterminate = false
+                                  bar.max = total
+                                  bar.progress = done
+                                  status.text = getString(R.string.processing, minOf(done + 1, total), total)
+                              }
+                          }
+                          getString(R.string.done, r.fileName, r.pages) +
+                              if (r.skipped > 0) getString(R.string.skipped, r.skipped) else ""
+                      } catch (e: Exception) {
+                          e.message ?: e.toString()
+                      }
+                      runOnUiThread {
+                          status.text = message
+                          bar.visibility = View.GONE
+                          pick.isEnabled = true
+                          busy = false
+                      }
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  if (isFinishing) executor.shutdown()
+              }
+          }
+          ZIP2PDF_EOF
+          mkdir -p app/src/main/java/com/example/zip2pdf
+          cat > app/src/main/java/com/example/zip2pdf/PdfWriter.kt <<'ZIP2PDF_EOF'
+          package com.example.zip2pdf
+
+          import java.io.BufferedOutputStream
+          import java.io.Closeable
+          import java.io.OutputStream
+          import java.util.Locale
+
+          /**
+           * Escritor de PDF mínimo y en streaming: una página por imagen JPEG (DCTDecode).
+           * Solo mantiene en memoria la página actual, así que soporta ZIP con muchas imágenes.
+           */
+          class PdfWriter(output: OutputStream) : Closeable {
+
+              private companion object {
+                  const val PX_TO_PT = 0.75   // 96 px = 72 pt
+              }
+
+              private val out = Counting(BufferedOutputStream(output, 64 * 1024))
+
+              // Índice = id de objeto. 0 libre, 1 catálogo y 2 árbol de páginas (se escriben al final).
+              private val offsets = arrayListOf(0L, 0L, 0L)
+              private val pageIds = ArrayList<Int>()
+
+              init {
+                  text("%PDF-1.4\n%\u00E2\u00E3\u00CF\u00D3\n")
+              }
+
+              fun addPage(jpeg: ByteArray, widthPx: Int, heightPx: Int) {
+                  val w = String.format(Locale.US, "%.2f", widthPx * PX_TO_PT)
+                  val h = String.format(Locale.US, "%.2f", heightPx * PX_TO_PT)
+                  val content = "q $w 0 0 $h 0 0 cm /Im0 Do Q"
+
+                  val imgId = begin()
+                  text("<< /Type /XObject /Subtype /Image /Width $widthPx /Height $heightPx " +
+                      "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.size} >>\nstream\n")
+                  out.write(jpeg, 0, jpeg.size)
+                  text("\nendstream")
+                  end()
+
+                  val contId = begin()
+                  text("<< /Length ${content.length} >>\nstream\n$content\nendstream")
+                  end()
+
+                  val pageId = begin()
+                  text("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 $w $h] " +
+                      "/Resources << /XObject << /Im0 $imgId 0 R >> >> /Contents $contId 0 R >>")
+                  end()
+                  pageIds.add(pageId)
+              }
+
+              fun finish() {
+                  offsets[2] = out.count
+                  text("2 0 obj\n<< /Type /Pages /Count ${pageIds.size} /Kids [${pageIds.joinToString(" ") { "$it 0 R" }}] >>\nendobj\n")
+                  offsets[1] = out.count
+                  text("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+
+                  val xrefPos = out.count
+                  text("xref\n0 ${offsets.size}\n0000000000 65535 f \n")
+                  for (id in 1 until offsets.size) {
+                      text(String.format(Locale.US, "%010d 00000 n \n", offsets[id]))
+                  }
+                  text("trailer\n<< /Size ${offsets.size} /Root 1 0 R >>\nstartxref\n$xrefPos\n%%EOF")
+                  out.flush()
+              }
+
+              override fun close() = out.close()
+
+              private fun begin(): Int {
+                  val id = offsets.size
+                  offsets.add(out.count)
+                  text("$id 0 obj\n")
+                  return id
+              }
+
+              private fun end() = text("\nendobj\n")
+
+              private fun text(s: String) {
+                  val b = s.toByteArray(Charsets.ISO_8859_1)
+                  out.write(b, 0, b.size)
+              }
+
+              private class Counting(private val delegate: OutputStream) : OutputStream() {
+                  var count = 0L
+                      private set
+
+                  override fun write(b: Int) {
+                      delegate.write(b)
+                      count++
+                  }
+
+                  override fun write(b: ByteArray, off: Int, len: Int) {
+                      delegate.write(b, off, len)
+                      count += len
+                  }
+
+                  override fun flush() = delegate.flush()
+                  override fun close() = delegate.close()
+              }
+          }
+          ZIP2PDF_EOF
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'ZIP2PDF_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:gravity="center"
+              android:keepScreenOn="true"
+              android:orientation="vertical"
+              android:padding="24dp">
+
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="@string/title"
+                  android:textSize="22sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp"
+                  android:layout_marginBottom="24dp"
+                  android:text="@string/subtitle" />
+
+              <Button
+                  android:id="@+id/pick"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="@string/pick" />
+
+              <ProgressBar
+                  android:id="@+id/bar"
+                  style="@android:style/Widget.ProgressBar.Horizontal"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="20dp"
+                  android:visibility="gone" />
+
+              <TextView
+                  android:id="@+id/status"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp" />
+          </LinearLayout>
+          ZIP2PDF_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'ZIP2PDF_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">ZIP a PDF</string>
+              <string name="title">ZIP de imágenes → PDF</string>
+              <string name="subtitle">Acepta .webp, .png y .jpg. Funciona sin Internet; el PDF se guarda en Descargas con el mismo nombre del ZIP.</string>
+              <string name="pick">Elegir archivo .zip</string>
+              <string name="reading">Leyendo el ZIP…</string>
+              <string name="processing">Procesando imagen %1$d de %2$d…</string>
+              <string name="done">Listo: %1$s (%2$d páginas) guardado en Descargas.</string>
+              <string name="skipped"> Se omitieron %1$d imágenes que no se pudieron leer.</string>
+          </resources>
+          ZIP2PDF_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'ZIP2PDF_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.Zip2Pdf" parent="Theme.AppCompat.DayNight.NoActionBar" />
+          </resources>
+          ZIP2PDF_EOF
+          cat > build.gradle.kts <<'ZIP2PDF_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          ZIP2PDF_EOF
+          cat > gradle.properties <<'ZIP2PDF_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          ZIP2PDF_EOF
+          mkdir -p gradle/wrapper
+          cat > gradle/wrapper/gradle-wrapper.properties <<'ZIP2PDF_EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          ZIP2PDF_EOF
+          cat > settings.gradle.kts <<'ZIP2PDF_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Zip2Pdf"
+          include(":app")
+          ZIP2PDF_EOF
+
+      - name: Compilar
+        working-directory: Zip2Pdf
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZIP-a-PDF-apk
+          path: Zip2Pdf/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publicar APK en Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp Zip2Pdf/app/build/outputs/apk/debug/app-debug.apk ZIP-a-PDF.apk
+          gh release create "apk-${{ github.run_number }}" ZIP-a-PDF.apk --repo "$GITHUB_REPOSITORY" --title "ZIP a PDF (compilación ${{ github.run_number }})" --notes "APK listo para instalar."
